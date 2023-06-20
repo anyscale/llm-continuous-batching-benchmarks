@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+if [ -z ${PORT+x} ]; then
+    echo "missing PORT"
+    exit 1
+fi
+
+if [ -z ${model_name+x} ]; then
+    echo "missing model_name"
+    exit 1
+fi
+
+if [ -z ${max_batch_total_tokens+x} ]; then
+    echo "missing max_batch_total_tokens"
+    exit 1
+fi
+
+if [ -z ${CUDA_VISIBLE_DEVICES+x} ]; then
+    echo "missing CUDA_VISIBLE_DEVICES"
+    exit 1
+fi
+
+ulimit -n 65536 && TEXT_GENERATION_SERVER_IGNORE_EOS_TOKEN=true \
+    text-generation-launcher \
+    --model-id $model_name \
+    --sharded false  \
+    --huggingface-hub-cache /data/cache \
+    --max-input-length 1024 \
+    --max-total-tokens 2048 \
+    --max-batch-total-tokens $max_batch_total_tokens \
+    --max-waiting-tokens 7 \
+    --waiting-served-ratio 1.2 \
+    --port $PORT \
+    --shard-uds-path /tmp/text-generation-server.2 \
+    --max-concurrent-requests 2000

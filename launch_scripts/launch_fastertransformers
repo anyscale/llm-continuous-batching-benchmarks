@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+
+import torch
+import uvicorn
+from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Request
+import deepspeed
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, pipeline
+from dataclasses import dataclass
+import threading
+import subprocess
+from types import SimpleNamespace
+import argparse
+import asyncio
+import time
+from typing import List, Dict, Optional
+import json
+import os
+from queue import Queue
+os.environ["TRANSFORMERS_CACHE"] = '/data/cache'
+
+assert 'CUDA_VISIBLE_DEVICES' in os.environ, "Set CUDA_VISIBLE_DEVICES, else this will take memory on each (and load model to 0)"
+
+
+app = FastAPI()
+
+
+class FasterTransformerModelCreator:
+
+    torch_extension_path = "/data/FasterTransformer/build/lib/libth_transformer.so"
+
+    def __init__(self):
+        raise NotImplementedError
+
+    @staticmethod
+    def _convert_model_to_ft(model_name: str):
+        assert 'opt' in model_name, "only opt is tested"
+
+        if not os.path.exists(f"/data/models/{model_name}/c-model/"):
+            subprocess.check_call("pip install -U transformers", shell=True)
+            subprocess.check_call(
+                "pip uninstall xgboost tensorflow -y", shell=True)
+            subprocess.check_call("sudo apt install git-lfs", shell=True)
+            subprocess.check_call(
+                "rm -rf /home/ray/anaconda3/lib/python3.10/site-packages/examples/", shell=True)
+            if not os.path.exists(f"/data/models/unpacking/{model_name}"):
+                subprocess.check_call(
+                    f"git lfs clone https://huggingface.co/{model_name} /data/models/unpacking/{model_name}", shell=True)
+                subprocess.check_call(
+                    f"cd /data/models/unpacking/{model_name} && git lfs pull", shell=True)
+
+            num_procs = os.cpu_count() - \
+                1 if model_name in ["facebook/opt-6.7b",
+                                    "facebook/opt-13b"] else 16
+            subprocess.check_call(
+                f"""python /data/FasterTransformer/examples/pytorch/gpt/utils/huggingface_opt_convert.py \
+                      -i /data/models/unpacking/{model_name} \
+                      -o /data/models/{model_name}/c-model/ \
+                      -i_g 1 \
+                      -weight_data_type fp16 \
+                      -p {num_procs}
+                """,
+                shell=True
+            )
+
+    @staticmethod
+    def _import_ft():
+        pass
+        import sys
+        sys.path.append("/data/FasterTransformer/")
+        sys.path.append("/data/FasterTransformer/examples/pytorch/gpt/")
+        from utils import gpt_decoder
+        from examples.pytorch.gpt.utils.parallel_gpt import ParallelGPT
+
+        return gpt_decoder, ParallelGPT
+
+    @staticmethod
+    def create(model_name: str, max_batch_size: int, dtype: torch.dtype = torch.float16, tensor_para_size: int = 1):
+
+        assert dtype == torch.float16
+        assert tensor_para_size == 1
+        assert model_name == 'facebook/opt-13b'
+
+        FasterTransformerModelCreator._convert_model_to_ft(model_name)
+
+        # Mock out necessary bits.
+        hf_config = {
+            'max_position_embeddings': 2048,
+            'activation_function': 'relu',
+            'do_layer_norm_before': True,
+            'num_attention_heads': 40,
+            'num_hidden_layers': 40,
+            'bos_token_id': 2,
+            'eos_token_id': 2,
+            'hidden_size': 5120,
+            'vocab_size': 50272,
+        }
+
+        vocab_size = hf_config['vocab_size']
+
+        config = SimpleNamespace(
+            bs=max_batch_size,
+            lib_path=FasterTransformerModelCreator.torch_extension_path,
+            data_type="fp16"
+        )
+
+        gpt_decoder, ParallelGPT = FasterTransformerModelCreator._import_ft()
+        ft_model_location = f"/data/models/{model_name}/c-model/"
+
+        dtype_map = {"fp16": torch.float16,
+                     "bf16": torch.bfloat16, "fp32": torch.float32}
+
+        head_num = hf_config['num_attention_heads']
+        layer_num = hf_config['num_hidden_layers']
+        start_id = hf_config['bos_token_id']
+        end_id = hf_config['eos_token_id']
+        size_per_head = hf_config['hidden_size'] // head_num
+
+        # opt specific params: some are fixed
+        layernorm_eps = 1e-5
+        layernorm_type = 'pre_layernorm' if hf_config['do_layer_norm_before'] else 'post_layernorm'
+        activation_type = 'Relu' if hf_config['activation_function'] == 'relu' else 'Gelu'
+        # https://github.com/huggingface/transformers/blob/main/src/transformers/models/opt/modeling_opt.py#L498
+        # has post decoder layernorm when layernorm_type is pre layernorm
+        has_post_decoder_layernorm = layernorm_type == 'pre_layernorm'
+
+        max_seq_len = hf_config['max_position_embeddings']
+        lib_path = config.lib_path
+        tensor_para_size = 1
+        ckpt_path = os.path.join(ft_model_location, f'{tensor_para_size}-gpu')
+
+        pipeline_para_size = 1
+
+        infer_decode_args = FasterTransformerModelCreator.create_infer_decode_args(
+            config.bs)
+
+        weights_data_type = 'fp16'
+        int8_mode = 0
+
+        import deepspeed
+        device = 'cuda'
+        with deepspeed.OnDevice(dtype=dtype_map[config.data_type], device=device):
+            gpt = ParallelGPT(head_num, size_per_head, vocab_size, start_id, end_id, layer_num,
+                              max_seq_len, tensor_para_size, pipeline_para_size, lib_path,
+                              inference_data_type=config.data_type,
+                              layernorm_eps=layernorm_eps,
+                              layernorm_type=layernorm_type,
+                              activation_type=activation_type,
+                              has_post_decoder_layernorm=has_post_decoder_layernorm,
+                              int8_mode=int8_mode,
+                              weights_data_type=weights_data_type)
+        print('Model structure created')
+        if not gpt.load(ckpt_path=ckpt_path):
+            print("[WARNING] Checkpoint file not found. Model loading is skipped.")
+        print('Model loaded')
+        gpt.eval()
+
+        return gpt, infer_decode_args
+
+    @staticmethod
+    def create_infer_decode_args(actual_batch_size, top_k=1, top_p=0.0, temperature=1, repetition_penalty=1, random_seed=0):
+        infer_decode_args = dict(
+            beam_width=1,
+            top_k=top_k * torch.ones(actual_batch_size, dtype=torch.int32),
+            top_p=top_p * torch.ones(actual_batch_size, dtype=torch.float32),
+            temperature=temperature *
+            torch.ones(actual_batch_size, dtype=torch.float32),
+            repetition_penalty=repetition_penalty *
+            torch.ones(actual_batch_size, dtype=torch.float32),
+            random_seed=random_seed *
+            torch.ones(actual_batch_size, dtype=torch.int64)
+        )
+
+        return infer_decode_args
+
+
+@dataclass
+class GenerationInputs:
+    req_id: int
+    prompt: str
+    sampling_config: dict
+
+
+@dataclass
+class GenerationOutput:
+    req_id: int
+    generated_text: str
+    num_output_tokens: int
+    error: str
+
+
+class ModelThread:
+    def __init__(self, model_name, max_batch_size, model_ready_event, progress_call, loop):
+        self.model_name = model_name
+        self.max_batch_size = max_batch_size
+        self.model_ready_event = model_ready_event
+        self.thread = None
+        self.input_queue = Queue()
+        self.output_queue = Queue()
+
+        self.progress_call = progress_call
+        self.loop = loop
+
+    def start_thread(self):
+        self.thread = threading.Thread(target=self._thread, daemon=True)
+        self.thread.start()
+
+    def _thread(self):
+        model, infer_decode_args = self.init_model(
+            self.model_name, self.max_batch_size)
+        tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+
+        self.model_ready_event.set()
+
+        while True:
+            print('model thread')
+            time.sleep(1)
+
+            gen_inputs = []
+            while not self.input_queue.empty() and len(gen_inputs) < self.max_batch_size:
+                gen_input = self.input_queue.get_nowait()
+                gen_inputs.append(gen_input)
+
+            if gen_inputs:
+                encoded_inputs = self.encode_inputs(
+                    tokenizer, [i.prompt for i in gen_inputs])
+                input_ids = encoded_inputs['input_ids']
+                desired_output_lens = [
+                    i.sampling_config["reponse_len"] for i in gen_inputs]
+
+                max_input_len = max(len(ids) for ids in input_ids)
+                for i, seq in enumerate(input_ids):
+                    missing_tokens = max_input_len - len(seq)
+
+                    if missing_tokens > 0:
+                        input_ids[i] = seq + \
+                            [tokenizer.pad_token_id for _ in range(
+                                missing_tokens)]
+
+                    assert len(input_ids[i]) == max_input_len
+
+                # for i, seq in enumerate(input_ids):
+                #    #lens = [1, 1, 1, 1]
+                #    #lens = [512, 512, 512, 512]
+                #    #input_ids[i] = [9213 for _ in range(lens[i])]
+                #    input_ids[i] = [9213 for _ in range(len(seq))]
+
+                # for i, seq in enumerate(desired_output_lens):
+                #    vals = [1536, 1536, 1536, 1536]
+                #    #vals = [11, 16, 41, 307]
+                #    desired_output_lens[i] = vals[i]
+
+                batch_token_ids = torch.tensor(
+                    input_ids, dtype=torch.int32).to('cuda')
+                lens = torch.tensor(
+                    [len(ids) for ids in input_ids], dtype=torch.int32).to('cuda')
+                output_len = max(desired_output_lens)
+                # output_len_t = torch.tensor(output_len, dtype=torch.int32)
+
+                print(f'input lens {[len(i) for i in input_ids]}')
+                print(f'output lens {[i for i in desired_output_lens]}')
+
+                infer_decode_args = FasterTransformerModelCreator.create_infer_decode_args(
+                    len(input_ids))
+
+                output = model(
+                    batch_token_ids,
+                    lens,
+                    output_len,
+                    min_length=torch.tensor(
+                        desired_output_lens, dtype=torch.int32),
+                    # min_length=output_len_t,
+                    # return_output_len=True,
+                    **infer_decode_args
+                )
+
+                outputs_cpu = output.tolist()
+
+                # print(f'Output from model {outputs_cpu=}')
+
+                decoded_outputs, tok_id_lens = self.decode_outputs(
+                    tokenizer, outputs_cpu)
+
+                for gen_input, output_text, tok_id_len in zip(gen_inputs, decoded_outputs, tok_id_lens):
+                    self.output_queue.put(
+                        GenerationOutput(
+                            req_id=gen_input.req_id,
+                            generated_text=output_text,
+                            num_output_tokens=tok_id_len,
+                            error=None,
+                        )
+                    )
+
+                asyncio.run_coroutine_threadsafe(self.progress_call(), loop)
+
+    @staticmethod
+    def encode_inputs(tokenizer, inputs):
+        return tokenizer(inputs)
+
+    @staticmethod
+    def decode_outputs(tokenizer, outputs):
+        decoded = []
+        lens = []
+        for seq in outputs:
+            for beam in seq:
+                lens.append(len(beam))
+                decoded.append(tokenizer.decode(beam))
+        return decoded, lens
+
+    @staticmethod
+    def init_model(model_name, max_batch_size):
+        print('Init model')
+
+        os.environ['RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '3130'
+
+        model, infer_decode_args = FasterTransformerModelCreator.create(
+            model_name, max_batch_size=max_batch_size)
+        print('Model ready')
+        return model, infer_decode_args
+
+
+class FastAPIServer:
+    def __init__(self, loop, model_name, max_batch_size):
+        assert model_name is not None
+        self.model_name = model_name
+        self.model_ready_event = asyncio.Event()
+
+        self.requests = {}
+        self.generations = {}
+        self.request_queue = []
+        self._next_req_id = 0
+
+        self.loop = loop
+
+        self.model_thread = ModelThread(
+            self.model_name, max_batch_size, self.model_ready_event, self.progress_async, self.loop)
+        self.model_thread.start_thread()
+
+    @property
+    def next_req_id(self):
+        rval = self._next_req_id
+        self._next_req_id += 1
+        return rval
+
+    async def progress_async(self):
+        return self.progress()
+
+    def progress(self):
+        sent_to_model = 0
+        recv_from_model = 0
+
+        for req_id in self.request_queue:
+            prompt, sampling_config = self.requests[req_id]
+            gen_inputs = GenerationInputs(
+                req_id,
+                prompt,
+                sampling_config,
+            )
+            self.model_thread.input_queue.put_nowait(gen_inputs)
+            sent_to_model += 1
+        self.request_queue = []
+
+        found_outputs = []
+        while not self.model_thread.output_queue.empty():
+            gen_output = self.model_thread.output_queue.get_nowait()
+            found_outputs.append(gen_output)
+            recv_from_model += 1
+
+        for output in found_outputs:
+            req_id = output.req_id
+            ready_event, _, _, _ = self.generations[req_id]
+            self.generations[req_id] = (
+                ready_event, output.generated_text, output.num_output_tokens, output.error)
+            ready_event.set()
+
+        print(f'progress {sent_to_model=} {recv_from_model=}')
+
+    async def is_ready(self):
+        return self.model_ready_event.is_set()
+
+    def add_request(self, prompt, sampling_config):
+        req_id = self.next_req_id
+        self.requests[req_id] = (prompt, sampling_config)
+        self.request_queue.append(req_id)
+
+        ready_event = asyncio.Event()
+        self.generations[req_id] = (ready_event, None, None, None)
+        return req_id
+
+    async def get_generation(self, req_id):
+        ready_event, _, _, _ = self.generations[req_id]
+        await ready_event.wait()
+        _, generation, num_output_tokens, error = self.generations[req_id]
+
+        del self.generations[req_id]
+        del self.requests[req_id]
+        return generation, num_output_tokens, error
+
+    async def generate(self, request_dict: Dict):
+        prompt = request_dict['inputs']
+        sampling_config = request_dict['parameters']
+
+        req_id = self.add_request(prompt, sampling_config)
+        self.progress()
+        generation, num_output_tokens, error = await self.get_generation(req_id)
+
+        return {
+            'generated_text': generation,
+            'num_output_tokens': num_output_tokens,
+            'error': error,
+        }
+
+
+@app.post("/generate")
+async def generate_stream(request: Request):
+    request_dict = await request.json()
+    return await server.generate(request_dict)
+
+
+@app.get("/is_ready")
+async def is_ready(request: Request):
+    return await server.is_ready()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--port', type=int, required=True)
+    parser.add_argument('--model-name', type=str, required=True)
+    parser.add_argument('--max-batch-size', type=int, required=True)
+    args = parser.parse_args()
+
+    loop = asyncio.new_event_loop()
+    server = FastAPIServer(loop, args.model_name, args.max_batch_size)
+
+    from uvicorn import Config, Server
+    config = Config(app=app, loop=loop, host='localhost',
+                    port=args.port, log_level="info")
+    uvicorn_server = Server(config)
+
+    loop.run_until_complete(uvicorn_server.serve())

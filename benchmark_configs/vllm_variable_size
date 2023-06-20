@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+
+export PORT=1031
+
+ranges=("32" "128" "512" "1536")
+max_batch_total_tokens_vals=("8700" "7500" "8100" "8100")
+
+function start_model_server {
+    local max_num_batched_tokens=$1
+
+    ulimit -n 65536 && CUDA_VISIBLE_DEVICES=7 ../launch_scripts/launch_vllm \
+        --port $PORT \
+        --model facebook/opt-13b \
+        --use-np-weights \
+        --max-num-batched-tokens $max_num_batched_tokens \
+        2>&1 &
+
+
+    while [ "$(curl -s http://localhost:${PORT}/is_ready | grep true | wc -l)" -eq 0 ]; do
+        sleep 1
+    done
+    echo "model server started on port $PORT"
+}
+
+function kill_model_server {
+    echo 'killing model server'
+    ps aux | grep '../launch_scripts/launch_vllm ' | grep -v 'vim' | awk '{print $2}' | xargs kill -9
+    wait
+}
+
+trap kill_model_server EXIT
+
+# Catch OOMs early.
+for i in ${!ranges[@]}; do
+    range=${ranges[$i]}
+    max_num_batched_tokens=${max_batch_total_tokens_vals[$i]}
+    echo "range $range, max_num_batched_tokens $max_num_batched_tokens"
+
+    start_model_server $max_num_batched_tokens
+
+    pushd ..
+        ./benchmark_throughput.py \
+            --port $PORT \
+            --backend vLLM  \
+            --random_prompt_lens_mean 512 \
+            --random_prompt_lens_range 0 \
+            --random_prompt_count 30 \
+            --gen_random_prompts \
+            --fixed_max_tokens $range
+    popd
+    kill_model_server
+
+done
+
+# Run real test
+for i in ${!ranges[@]}; do
+    range=${ranges[$i]}
+    num_prompts=1000
+    max_num_batched_tokens=${max_batch_total_tokens_vals[$i]}
+    echo "range $range, max_num_batched_tokens $max_num_batched_tokens"
+
+    start_model_server $max_num_batched_tokens
+
+    pushd ..
+        ulimit -n 65536 && ./benchmark_throughput.py \
+            --port $PORT \
+            --backend vLLM \
+            --random_prompt_lens_mean 512 \
+            --random_prompt_lens_range 0 \
+            --random_prompt_count $num_prompts \
+            --gen_random_prompts \
+            --variable_response_lens_mean 128 \
+            --variable_response_lens_range $range \
+            --variable_response_lens_distribution capped_exponential \
+            --allow_variable_generation_length \
+            --results_filename ${HOME}/result/vllm_range_${range}_$(date '+%Y-%m-%d_%H:%M:%S').log
+    popd
+    kill_model_server
+
+done

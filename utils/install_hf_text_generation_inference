@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+git clone git@github.com:huggingface/text-generation-inference /data/text-generation-inference
+
+# Install rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+PROTOC_ZIP=protoc-21.12-linux-x86_64.zip
+curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v21.12/$PROTOC_ZIP
+sudo unzip -o $PROTOC_ZIP -d /usr/local bin/protoc
+sudo unzip -o $PROTOC_ZIP -d /usr/local 'include/*'
+rm -f $PROTOC_ZIP
+
+sudo apt-get install libssl-dev gcc -y
+pushd /data/text-generation-inference
+    BUILD_EXTENSIONS=False make install
+popd
+
+pip install protobuf==3.20.0

@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+export PORT=1030
+
+ranges=("32" "128" "512" "1536")
+batch_sizes=("4" "12" "8" "4")
+
+function start_model_server {
+    local static_batch_size=$1
+
+    ulimit -n 65536 && CUDA_VISIBLE_DEVICES=4 ../launch_scripts/launch_ray_dynamic_gen \
+        --port $PORT \
+        --policy impatient_static \
+        --model-name facebook/opt-13b \
+        --static-batch-size $static_batch_size \
+        2>&1 &
+    
+    while [ "$(curl -s http://localhost:${PORT}/is_ready | grep true | wc -l)" -eq 0 ]; do
+        sleep 1
+    done
+    echo "model server started on port $PORT, static_batch_size $static_batch_size"
+}
+
+function kill_model_server {
+    echo 'killing model server'
+    ps aux | grep '../launch_scripts/launch_ray_dynamic_gen' | awk '{print $2}' | xargs kill -9
+    wait
+}
+
+trap kill_model_server EXIT
+
+# Catch OOMs early.
+for i in ${!ranges[@]}; do
+    range=${ranges[$i]}
+    max_batch_total_tokens=${max_batch_total_tokens_vals[$i]}
+    
+
+    echo "range $range max_batch_total_tokens $max_batch_total_tokens"
+
+    start_model_server $max_batch_total_tokens
+
+    pushd ..
+        ./benchmark_throughput.py \
+            --port $PORT \
+            --backend HfTextGenerationInference \
+            --random_prompt_lens_mean 512 \
+            --random_prompt_lens_range 0 \
+            --random_prompt_count 10 \
+            --gen_random_prompts \
+            --fixed_max_tokens $range
+    popd
+
+    kill_model_server
+done
+
+# Run real test
+for i in ${!ranges[@]}; do
+    range=${ranges[$i]}
+    batch_size=${batch_sizes[$i]}
+    
+    echo "range $range static_batch_size $batch_size"
+    QPS=4
+
+    start_model_server $batch_size
+
+    pushd ..
+        ./benchmark_throughput.py \
+            --port $PORT \
+            --backend RayGen \
+            --gen_random_prompts \
+            --random_prompt_lens_mean 256 \
+            --random_prompt_lens_range 256 \
+            --random_prompt_count 100 \
+            --variable_response_lens_mean 128 \
+            --variable_response_lens_range $range \
+            --variable_response_lens_distribution capped_exponential \
+            --allow_variable_generation_length \
+            --distribution poisson \
+            --qps $QPS \
+            --results_filename ${HOME}/result/latency_ray_static_qps_${QPS}_range_${range}_$(date '+%Y-%m-%d_%H:%M:%S').log \
+            --log_latencies \
+            --fail_on_response_failure
+    popd
+
+    kill_model_server
+done

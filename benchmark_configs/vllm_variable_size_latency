@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+
+export PORT=1032
+
+function start_model_server {
+
+    ulimit -n 65536 && CUDA_VISIBLE_DEVICES=6 ../launch_scripts/launch_vllm \
+        --port $PORT \
+        --model facebook/opt-13b \
+        --max-num-batched-tokens 8100 \
+        --use-np-weights \
+        2>&1 &
+
+    while [ "$(curl -s http://localhost:${PORT}/is_ready | grep true | wc -l)" -eq 0 ]; do
+        sleep 1
+    done
+    echo "model server started on port $PORT"
+}
+
+function kill_model_server {
+    echo 'killing model server'
+    ps aux | grep '../launch_scripts/launch_vllm' | grep -v 'vim' | awk '{print $2}' | xargs kill -9
+    wait
+}
+
+trap kill_model_server EXIT
+
+# Catch OOMs early.
+for i in ${!ranges[@]}; do
+    range=${ranges[$i]}
+    echo "$range"
+
+    start_model_server
+
+    pushd ..
+        ./benchmark_throughput.py \
+            --port $PORT \
+            --backend vLLM \
+            --random_prompt_lens_mean 512 \
+            --random_prompt_lens_range 0 \
+            --random_prompt_count 10 \
+            --gen_random_prompts \
+            --fixed_max_tokens $range
+    popd
+    kill_model_server
+
+done
+
+# Run real test
+for qps in 8 16 32; do
+    QPS=$qps
+    range=1536
+    num_prompts=5000
+    echo "$range $num_prompts $QPS"
+
+    start_model_server
+
+    pushd ..
+        ulimit -n 65536 && ./benchmark_throughput.py \
+            --port $PORT \
+            --backend vLLM \
+            --random_prompt_lens_mean 256 \
+            --random_prompt_lens_range 256 \
+            --random_prompt_count $num_prompts \
+            --gen_random_prompts \
+            --variable_response_lens_mean 128 \
+            --variable_response_lens_range $range \
+            --variable_response_lens_distribution capped_exponential \
+            --allow_variable_generation_length \
+            --results_filename ${HOME}/result/vllm_qps_${QPS}_numprompts_${num_promps}_range_${range}_$(date '+%Y-%m-%d_%H:%M:%S').log \
+            --distribution poisson \
+            --qps $QPS \
+            --log_latencies \
+            --fail_on_response_failure
+
+    popd
+    kill_model_server
+
+done

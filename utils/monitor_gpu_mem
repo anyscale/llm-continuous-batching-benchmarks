@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+import time
+
+
+def wait_for_gpu_memory_to_clear(devices):
+    from pynvml import nvmlDeviceGetHandleByIndex, nvmlDeviceGetMemoryInfo, nvmlInit
+    nvmlInit()
+    while True:
+        output = {}
+        for device in devices:
+            dev_handle = nvmlDeviceGetHandleByIndex(device)
+            mem_info = nvmlDeviceGetMemoryInfo(dev_handle)
+            gb_used = mem_info.used / 2**30
+            output[device] = f'{gb_used:.02f}'
+
+        for k, v in output.items():
+            print(f'{k}={v}; ', end='')
+        print('')
+        time.sleep(5)
+
+
+wait_for_gpu_memory_to_clear(list(range(8)))

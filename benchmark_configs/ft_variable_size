@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+
+export PORT=1029
+
+ranges=("32" "128" "512" "1536")
+batch_sizes=("16" "12" "8" "4")
+
+function start_model_server {
+    local max_batch_size=$1
+
+    ulimit -n 65536 && CUDA_VISIBLE_DEVICES=3 ../launch_scripts/launch_fastertransformers \
+        --port $PORT \
+        --model-name facebook/opt-13b \
+        --max-batch-size $max_batch_size \
+        2>&1 &
+
+    while [ "$(curl -s http://localhost:${PORT}/is_ready | grep true | wc -l)" -eq 0 ]; do
+        sleep 1
+    done
+    echo "model server started on port $PORT, max_batch_size $max_batch_size"
+}
+
+function kill_model_server {
+    echo 'killing model server'
+    ps aux | grep '../launch_scripts/launch_fastertransformers' | awk '{print $2}' | xargs kill -9
+    wait
+}
+
+trap kill_model_server EXIT
+
+# Catch OOMs early.
+for i in ${!ranges[@]}; do
+    range=${ranges[$i]}
+    batch_size=${batch_sizes[$i]}
+    echo "$range $batch_size"
+
+    start_model_server $batch_size
+
+    pushd ..
+        ./benchmark_throughput.py \
+            --port $PORT \
+            --backend FasterTransformer \
+            --random_prompt_lens_mean 512 \
+            --random_prompt_lens_range 0 \
+            --random_prompt_count $batch_size \
+            --gen_random_prompts \
+            --fixed_max_tokens $range
+    popd
+    kill_model_server
+
+done
+
+# Run real test
+for i in ${!ranges[@]}; do
+    range=${ranges[$i]}
+    batch_size=${batch_sizes[$i]}
+    target_num_prompts=1000
+    num_prompts=$(python -c "from math import ceil; print(ceil(${target_num_prompts} / ${batch_size}) * ${batch_size})")
+    echo "$range $batch_size $num_prompts"
+
+    start_model_server $batch_size
+
+    pushd ..
+        ulimit -n 65536 && ./benchmark_throughput.py \
+            --port $PORT \
+            --backend FasterTransformer \
+            --random_prompt_lens_mean 512 \
+            --random_prompt_lens_range 0 \
+            --random_prompt_count $num_prompts \
+            --gen_random_prompts \
+            --variable_response_lens_mean 128 \
+            --variable_response_lens_range $range \
+            --variable_response_lens_distribution capped_exponential \
+            --allow_variable_generation_length \
+            --results_filename ${HOME}/result/ft_range_${range}_$(date '+%Y-%m-%d_%H:%M:%S').log \
+            --print-generation-lens-and-exit
+    popd
+    kill_model_server
+
+done

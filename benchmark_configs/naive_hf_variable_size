@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+export PORT=1025
+
+ranges=("32" "128" "512" "1536")
+batch_sizes=("16" "12" "8" "4")
+
+# Catch OOMs early.
+for i in ${!ranges[@]}; do
+    range=${ranges[$i]}
+    batch_size=${batch_sizes[$i]}
+    echo "$range $batch_size"
+    pushd ..
+        export NAIVE_HF_BS=$batch_size
+        ./benchmark_throughput.py \
+            --port $PORT \
+            --backend NaiveHfPipeline \
+            --random_prompt_lens_mean 512 \
+            --random_prompt_lens_range 0 \
+            --random_prompt_count $batch_size \
+            --gen_random_prompts \
+            --fixed_max_tokens $range
+    popd
+done
+
+# Run real test
+for i in ${!ranges[@]}; do
+    range=${ranges[$i]}
+    batch_size=${batch_sizes[$i]}
+    target_num_prompts=1000
+    num_prompts=$(python -c "from math import ceil; print(ceil(${target_num_prompts} / ${batch_size}) * ${batch_size})")
+    echo "$range $batch_size $num_prompts"
+    export NAIVE_HF_BS=$batch_size
+    pushd ..
+        ./benchmark_throughput.py \
+            --port $PORT \
+            --backend NaiveHfPipeline \
+            --random_prompt_lens_mean 512 \
+            --random_prompt_lens_range 0 \
+            --random_prompt_count $num_prompts \
+            --gen_random_prompts \
+            --variable_response_lens_mean 128 \
+            --variable_response_lens_range $range \
+            --variable_response_lens_distribution capped_exponential \
+            --allow_variable_generation_length \
+            --results_filename ${HOME}/result/naive_hf_range_${range}_$(date '+%Y-%m-%d_%H:%M:%S').log
+    popd
+done
