@@ -51,7 +51,7 @@ class VLLMPredictDeployment:
                 yield (json.dumps(ret) + "\0").encode("utf-8")
 
         async def abort_request() -> None:
-            await engine.abort(request_id)
+            await self.engine.abort(request_id)
 
         if stream:
             background_tasks = BackgroundTasks()
@@ -64,7 +64,7 @@ class VLLMPredictDeployment:
         async for request_output in results_generator:
             if await request.is_disconnected():
                 # Abort the request if the client disconnects.
-                await engine.abort(request_id)
+                await self.engine.abort(request_id)
                 return Response(status_code=499)
             final_output = request_output
 
@@ -93,8 +93,10 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, required=True)
     args = parser.parse_args()
 
-    model = 'facebook/opt-13b'
+    model = 'facebook/opt-125m' #'facebook/opt-13b'
     deployment = VLLMPredictDeployment.bind(
-        model=model, max_num_batched_tokens=8100, use_np_weights=True)
+        model=model, max_num_batched_tokens=8100)
     serve.run(deployment, port=args.port)
     send_request()
+    while True:
+        pass
