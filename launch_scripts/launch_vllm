@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import subprocess
 import threading
 from dataclasses import dataclass
-from vllm import ServerArgs, LLMServer, SamplingParams
+from vllm import EngineArgs, LLMEngine, SamplingParams
 import os
 os.environ["TRANSFORMERS_CACHE"] = '/data/cache'
 
@@ -88,7 +88,7 @@ class ModelThread:
 
             needs_call_progress = False
             for vllm_output in vllm_outputs:
-                if not vllm_output.finished():
+                if not vllm_output.finished:
                     continue
 
                 needs_call_progress = True
@@ -111,8 +111,8 @@ class ModelThread:
     @staticmethod
     def init_model(vllm_args):
         print('Init model')
-        server_args = ServerArgs.from_cli_args(vllm_args)
-        server = LLMServer.from_server_args(server_args)
+        server_args = EngineArgs.from_cli_args(vllm_args)
+        server = LLMEngine.from_engine_args(server_args)
         print('Model ready')
         return server
 
@@ -225,10 +225,10 @@ async def is_ready(request: Request):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, required=True)
-    ServerArgs.add_cli_args(parser)
+    EngineArgs.add_cli_args(parser)
     args = parser.parse_args()
 
-    vllm_args = ServerArgs.from_cli_args(args)
+    vllm_args = EngineArgs.from_cli_args(args)
 
     loop = asyncio.new_event_loop()
     server = FastAPIServer(loop, vllm_args)
